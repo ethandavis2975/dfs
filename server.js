@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 8080;
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '2', 10);
 const GS_TIMEOUT_MS = parseInt(process.env.GS_TIMEOUT_MS || '120000', 10);
 const MAX_FILE_MB = parseInt(process.env.MAX_FILE_MB || '50', 10);
+const MAX_QUEUE_WAIT_MS = parseInt(process.env.MAX_QUEUE_WAIT_MS || '45000', 10); // NEW: bail early if waiting > 45s
 const FILE_TTL_MS = 5 * 60 * 1000;
 const uploadDir = '/tmp/uploads';
 const outputDir = '/tmp/output';
@@ -51,17 +52,48 @@ setInterval(() => {
   });
 }, 60 * 1000);
 
-// ---------- Concurrency queue ----------
+// ---------- Concurrency queue (with wait timeout + abort awareness) ----------
 let active = 0;
 const waiting = [];
-const acquire = () => new Promise(resolve => {
-  if (active < MAX_CONCURRENT) { active++; return resolve(); }
-  waiting.push(resolve);
+
+const acquire = (req) => new Promise((resolve, reject) => {
+  if (active < MAX_CONCURRENT) {
+    active++;
+    return resolve();
+  }
+  let settled = false;
+  const entry = {
+    grant: () => {
+      if (settled) return false;
+      settled = true;
+      active++;
+      clearTimeout(timer);
+      req.removeListener('close', onAbort);
+      resolve();
+      return true;
+    },
+    cancel: (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      req.removeListener('close', onAbort);
+      const idx = waiting.indexOf(entry);
+      if (idx >= 0) waiting.splice(idx, 1);
+      reject(err);
+    },
+  };
+  const timer = setTimeout(() => entry.cancel(new Error('QUEUE_TIMEOUT')), MAX_QUEUE_WAIT_MS);
+  const onAbort = () => entry.cancel(new Error('CLIENT_ABORTED'));
+  req.on('close', onAbort);
+  waiting.push(entry);
 });
+
 const release = () => {
   active--;
-  const next = waiting.shift();
-  if (next) { active++; next(); }
+  while (waiting.length && active < MAX_CONCURRENT) {
+    const next = waiting.shift();
+    if (next.grant()) break;
+  }
 };
 
 // ---------- Multer ----------
@@ -82,7 +114,7 @@ const upload = multer({
 
 // ---------- Routes ----------
 app.get('/', (req, res) =>
-  res.json({ message: 'EPS to PNG Converter', version: '3.0.0', active, waiting: waiting.length })
+  res.json({ message: 'EPS to PNG Converter', version: '3.1.0', active, waiting: waiting.length })
 );
 app.get('/health', (req, res) =>
   res.json({ status: 'OK', active, waiting: waiting.length, ts: new Date().toISOString() })
@@ -95,12 +127,30 @@ app.post('/convert', upload.single('file'), async (req, res) => {
   const outputPath = path.join(outputDir, path.parse(req.file.filename).name + '.png');
   const dpi = Math.min(Math.max(parseInt(req.body.quality) || 150, 72), 200);
 
-  await acquire();
+  // Acquire slot — bail out if client aborted or queue wait too long
+  try {
+    await acquire(req);
+  } catch (e) {
+    safeUnlink(inputPath);
+    if (e.message === 'CLIENT_ABORTED') {
+      console.log('[queue] client aborted before slot:', req.file.originalname);
+      return; // socket already closed
+    }
+    // QUEUE_TIMEOUT — tell client to retry
+    if (!res.headersSent) {
+      res.set('Retry-After', '5');
+      res.status(503).json({ error: 'Server busy, please retry', retryAfterSec: 5 });
+    }
+    return;
+  }
+
   let released = false;
   const doRelease = () => { if (!released) { released = true; release(); } };
 
   let child;
+  let clientGone = false;
   req.on('close', () => {
+    clientGone = true;
     if (child && !child.killed) { try { child.kill('SIGKILL'); } catch {} }
   });
 
@@ -120,6 +170,13 @@ app.post('/convert', upload.single('file'), async (req, res) => {
   child = execFile('gs', args, { timeout: GS_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, killSignal: 'SIGKILL' },
     (err, stdout, stderr) => {
       safeUnlink(inputPath);
+
+      if (clientGone) {
+        console.log('[convert] client gone, skipping download:', req.file.originalname);
+        safeUnlink(outputPath);
+        doRelease();
+        return;
+      }
 
       if (err || !fs.existsSync(outputPath)) {
         doRelease();
@@ -156,5 +213,5 @@ const server = app.listen(PORT, '0.0.0.0', () =>
   console.log(`Server running on ${PORT}, max concurrent: ${MAX_CONCURRENT}`)
 );
 server.requestTimeout = 0;
-server.headersTimeout = 130000;
-server.keepAliveTimeout = 125000;
+server.headersTimeout = 310000;     // 5 min — survive long queue waits
+server.keepAliveTimeout = 305000;   // 5 min — match Railway proxy idle
